@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import DEFAULT_FEATURES
+from transforms import DriftingBlob, FrameDecimator, HorizontalFlipWithActionMirror, ROBOT_PRESETS, StaticErasing
 
 DEFAULT_FEATURE_KEYS = set(DEFAULT_FEATURES.keys())
 
@@ -65,42 +66,40 @@ def build_random_erasing(args):
     )
 
 
-class StaticErasing:
-    """Erases a fixed rectangle - sampled once, applied to every frame.
-
-    Call resample() at the start of each episode to pick a new patch position.
-    Simulates static occlusions like dirt on the camera lens.
-    """
-
-    def __init__(self, scale=(0.02, 0.15), value=0.0):
-        self.scale = scale
-        self.value = value
-        self.i = self.j = self.h = self.w = 0
-
-    def resample(self, img_h, img_w):
-        """Pick a new random rectangle for this episode."""
-        import random
-        area = img_h * img_w
-        erase_area = random.uniform(self.scale[0], self.scale[1]) * area
-        aspect = random.uniform(0.5, 2.0)
-        self.h = int(round((erase_area * aspect) ** 0.5))
-        self.w = int(round((erase_area / aspect) ** 0.5))
-        self.h = min(self.h, img_h)
-        self.w = min(self.w, img_w)
-        self.i = random.randint(0, img_h - self.h)
-        self.j = random.randint(0, img_w - self.w)
-
-    def __call__(self, img):
-        img = img.clone()
-        img[:, self.i:self.i + self.h, self.j:self.j + self.w] = self.value
-        return img
-
-    def __repr__(self):
-        return f"StaticErasing(scale={self.scale})"
-
-
 def build_static_erasing(args):
     return StaticErasing(scale=tuple(args.erasing_scale))
+
+
+def build_frame_decimate(args):
+    return FrameDecimator(remove_every_n=args.remove_every_n)
+
+
+def build_drifting_blob(args):
+    return DriftingBlob(
+        radius=args.blob_radius,
+        speed=args.blob_speed,
+        softness=args.blob_softness,
+        opacity=args.blob_opacity,
+    )
+
+
+def build_horizontal_flip(args):
+    if args.robot_type and args.robot_type in ROBOT_PRESETS:
+        preset = ROBOT_PRESETS[args.robot_type]
+        return HorizontalFlipWithActionMirror(
+            action_mirror_mask=args.action_mirror_mask or preset["action_mirror_mask"],
+            state_mirror_mask=args.state_mirror_mask or preset["state_mirror_mask"],
+            swap_action_ranges=preset.get("swap_action_ranges"),
+            swap_state_ranges=preset.get("swap_state_ranges"),
+        )
+    if not args.action_mirror_mask or not args.state_mirror_mask:
+        print("Error: --action-mirror-mask and --state-mirror-mask are required "
+              "when --robot-type is not specified.")
+        sys.exit(1)
+    return HorizontalFlipWithActionMirror(
+        action_mirror_mask=args.action_mirror_mask,
+        state_mirror_mask=args.state_mirror_mask,
+    )
 
 
 AUGMENTATION_BUILDERS = {
@@ -109,6 +108,9 @@ AUGMENTATION_BUILDERS = {
     "sharpness": build_sharpness,
     "random_erasing": build_random_erasing,
     "static_erasing": build_static_erasing,
+    "frame_decimate": build_frame_decimate,
+    "drifting_blob": build_drifting_blob,
+    "horizontal_flip": build_horizontal_flip,
 }
 
 
@@ -186,13 +188,24 @@ def copy_episode(source, output, ep_idx, feature_keys, features_meta):
     output.save_episode()
 
 
+def decimate_episode(source, output, ep_idx, decimator, feature_keys, features_meta):
+    """Copy an episode, skipping every Nth frame as determined by the decimator."""
+    from_idx, to_idx = get_episode_range(source, ep_idx)
+    for local_idx, global_idx in enumerate(range(from_idx, to_idx)):
+        if not decimator.should_keep(local_idx):
+            continue
+        item = source[global_idx]
+        frame = build_frame_dict(item, feature_keys, features_meta)
+        output.add_frame(frame)
+    output.save_episode()
+
+
 def augment_episode(source, output, ep_idx, transform, feature_keys, camera_keys, features_meta):
     """Create an augmented copy of an episode."""
     from_idx, to_idx = get_episode_range(source, ep_idx)
 
-    # For static transforms, sample patch position once per episode
-    # by peeking at the first frame's image size
-    if isinstance(transform, StaticErasing):
+    # For transforms that need per-episode initialization, call resample()
+    if isinstance(transform, (StaticErasing, DriftingBlob)):
         first = source[from_idx]
         for cam_key in camera_keys:
             if cam_key in first:
@@ -207,6 +220,31 @@ def augment_episode(source, output, ep_idx, transform, feature_keys, camera_keys
             if cam_key in item:
                 img = item[cam_key]  # float32 CHW tensor in [0, 1]
                 item[cam_key] = transform(img)
+        frame = build_frame_dict(item, feature_keys, features_meta)
+        output.add_frame(frame)
+    output.save_episode()
+
+
+def augment_episode_with_flip(source, output, ep_idx, flip, feature_keys, camera_keys, features_meta):
+    """Create an augmented copy of an episode with horizontal flip and action/state mirroring.
+
+    Unlike augment_episode which only modifies images, this also mirrors
+    the action and state vectors so they remain consistent with the flipped
+    visual observations.
+    """
+    from_idx, to_idx = get_episode_range(source, ep_idx)
+
+    for global_idx in range(from_idx, to_idx):
+        item = source[global_idx]
+        # Flip all camera images
+        for cam_key in camera_keys:
+            if cam_key in item:
+                item[cam_key] = flip.flip_image(item[cam_key])
+        # Mirror action and state vectors
+        if "action" in item:
+            item["action"] = flip.mirror_actions(item["action"])
+        if "observation.state" in item:
+            item["observation.state"] = flip.mirror_state(item["observation.state"])
         frame = build_frame_dict(item, feature_keys, features_meta)
         output.add_frame(frame)
     output.save_episode()
@@ -253,6 +291,23 @@ def parse_args():
     # Random erasing params
     parser.add_argument("--erasing-p", type=float, default=0.5, help="Random erasing probability (default: 0.5)")
     parser.add_argument("--erasing-scale", nargs=2, type=float, default=[0.02, 0.15], metavar=("MIN", "MAX"))
+
+    # DriftingBlob params
+    parser.add_argument("--blob-radius", type=int, default=30, help="Blob radius in pixels (default: 30)")
+    parser.add_argument("--blob-speed", type=float, default=2.0, help="Blob drift speed in pixels/frame (default: 2.0)")
+    parser.add_argument("--blob-softness", type=float, default=0.6, help="Blob edge softness, 0=hard 1=diffuse (default: 0.6)")
+    parser.add_argument("--blob-opacity", type=float, default=0.5, help="Blob opacity, 0=invisible 1=fully blended to avg color (default: 0.5)")
+
+    # Frame decimation params
+    parser.add_argument("--remove-every-n", type=int, default=5, help="Remove every Nth frame (default: 5, used with --augmentations frame_decimate)")
+
+    # Horizontal flip params
+    parser.add_argument("--robot-type", type=str, default=None, choices=list(ROBOT_PRESETS.keys()),
+                        help="Robot preset for horizontal flip mirror masks (e.g. aloha)")
+    parser.add_argument("--action-mirror-mask", nargs="+", type=float, default=None,
+                        help="Per-dimension mask for action mirroring: 1=keep, -1=negate (e.g. 1 -1 1 -1 1 1)")
+    parser.add_argument("--state-mirror-mask", nargs="+", type=float, default=None,
+                        help="Per-dimension mask for state mirroring: 1=keep, -1=negate (e.g. 1 -1 1 -1 1 1)")
 
     # Output config
     parser.add_argument("--vcodec", default="libsvtav1", help="Video codec (default: libsvtav1)")
@@ -330,8 +385,25 @@ def main():
                 copy_episode(source, output, ep_idx, feature_keys, features_meta)
 
         # ---- Augmentation passes ----
-        transform = build_transform(args)
-        print(f"\nAugmentation transform: {transform}")
+        use_decimation = "frame_decimate" in args.augmentations
+        use_flip = "horizontal_flip" in args.augmentations
+        image_augmentations = [a for a in args.augmentations if a not in ("frame_decimate", "horizontal_flip")]
+
+        if use_decimation:
+            decimator = build_frame_decimate(args)
+            print(f"\nFrame decimation: {decimator}")
+
+        if use_flip:
+            flip = build_horizontal_flip(args)
+            print(f"Horizontal flip: {flip}")
+
+        if image_augmentations:
+            # Temporarily override args.augmentations for build_transform
+            saved_augmentations = args.augmentations
+            args.augmentations = image_augmentations
+            transform = build_transform(args)
+            args.augmentations = saved_augmentations
+            print(f"Image transform: {transform}")
 
         for pass_idx in range(args.num_passes):
             if args.seed is not None:
@@ -339,7 +411,33 @@ def main():
 
             desc = f"Pass {pass_idx + 1}/{args.num_passes}"
             for ep_idx in tqdm(episode_indices, desc=desc):
-                augment_episode(source, output, ep_idx, transform, feature_keys, camera_keys, features_meta)
+                if use_decimation and not image_augmentations and not use_flip:
+                    decimate_episode(source, output, ep_idx, decimator, feature_keys, features_meta)
+                elif use_flip and not use_decimation and not image_augmentations:
+                    augment_episode_with_flip(source, output, ep_idx, flip, feature_keys, camera_keys, features_meta)
+                elif not use_decimation and not use_flip and image_augmentations:
+                    augment_episode(source, output, ep_idx, transform, feature_keys, camera_keys, features_meta)
+                else:
+                    # Combination: decimate, flip, and/or image augmentations inline
+                    from_idx, to_idx = get_episode_range(source, ep_idx)
+                    for local_idx, global_idx in enumerate(range(from_idx, to_idx)):
+                        if use_decimation and not decimator.should_keep(local_idx):
+                            continue
+                        item = source[global_idx]
+                        for cam_key in camera_keys:
+                            if cam_key in item:
+                                if use_flip:
+                                    item[cam_key] = flip.flip_image(item[cam_key])
+                                if image_augmentations:
+                                    item[cam_key] = transform(item[cam_key])
+                        if use_flip:
+                            if "action" in item:
+                                item["action"] = flip.mirror_actions(item["action"])
+                            if "observation.state" in item:
+                                item["observation.state"] = flip.mirror_state(item["observation.state"])
+                        frame = build_frame_dict(item, feature_keys, features_meta)
+                        output.add_frame(frame)
+                    output.save_episode()
 
         # ---- Finalize ----
         print("\nFinalizing dataset...")
