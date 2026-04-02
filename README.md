@@ -62,4 +62,12 @@ environment.yml      # Conda environment
 
 ## How AI coding agents were used
 
-This project was built with **Claude Code** (Anthropic's CLI agent).
+ -This project was built with **Claude Code** (Anthropic's CLI agent). The workflow:                                  
+1. **Research**: Claude Code fetched LeRobot v3 docs, inspected the `LeRobotDataset` API, and explored source code to understand data formats (CHW float32 tensors in, HWC numpy arrays out via `add_frame`).
+2. **Design**: A planning agent designed the architecture — choosing the high-level `add_frame` loop over low-level video manipulation, and identifying the key constraint that geometric augmentations (like horizontal flip) must also transform action/state data to avoid contradictory training signals.                                               
+3. **Implementation**: Claude Code wrote the tool iteratively, debugging conda/arm64 issues, frame format conversions (CHW to HWC), and cache conflicts along the way.
+4. **Testing**: Verified each augmentation by comparing original vs. augmented frames visually and — for horizontal flip — numerically validating that action/state vectors were correctly mirrored.  
+
+
+
+
