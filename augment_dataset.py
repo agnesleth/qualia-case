@@ -35,7 +35,7 @@ DEFAULT_FEATURE_KEYS = set(DEFAULT_FEATURES.keys())
 # Augmentation registry
 # ---------------------------------------------------------------------------
 
-def build_color_jitter(args):
+def build_color_jitter(args): #adjusts brightness, contrast, saturation, hue
     return v2.ColorJitter(
         brightness=tuple(args.brightness),
         contrast=tuple(args.contrast),
@@ -44,14 +44,14 @@ def build_color_jitter(args):
     )
 
 
-def build_gaussian_blur(args):
+def build_gaussian_blur(args): #applies a Gaussian blur to the image
     return v2.GaussianBlur(
         kernel_size=args.blur_kernel,
         sigma=tuple(args.blur_sigma),
     )
 
 
-def build_sharpness(args):
+def build_sharpness(args): #adjusts the sharpness of the image
     return v2.RandomAdjustSharpness(
         sharpness_factor=args.sharpness_factor,
         p=1.0,
@@ -65,11 +65,50 @@ def build_random_erasing(args):
     )
 
 
+class StaticErasing:
+    """Erases a fixed rectangle - sampled once, applied to every frame.
+
+    Call resample() at the start of each episode to pick a new patch position.
+    Simulates static occlusions like dirt on the camera lens.
+    """
+
+    def __init__(self, scale=(0.02, 0.15), value=0.0):
+        self.scale = scale
+        self.value = value
+        self.i = self.j = self.h = self.w = 0
+
+    def resample(self, img_h, img_w):
+        """Pick a new random rectangle for this episode."""
+        import random
+        area = img_h * img_w
+        erase_area = random.uniform(self.scale[0], self.scale[1]) * area
+        aspect = random.uniform(0.5, 2.0)
+        self.h = int(round((erase_area * aspect) ** 0.5))
+        self.w = int(round((erase_area / aspect) ** 0.5))
+        self.h = min(self.h, img_h)
+        self.w = min(self.w, img_w)
+        self.i = random.randint(0, img_h - self.h)
+        self.j = random.randint(0, img_w - self.w)
+
+    def __call__(self, img):
+        img = img.clone()
+        img[:, self.i:self.i + self.h, self.j:self.j + self.w] = self.value
+        return img
+
+    def __repr__(self):
+        return f"StaticErasing(scale={self.scale})"
+
+
+def build_static_erasing(args):
+    return StaticErasing(scale=tuple(args.erasing_scale))
+
+
 AUGMENTATION_BUILDERS = {
     "color_jitter": build_color_jitter,
     "gaussian_blur": build_gaussian_blur,
     "sharpness": build_sharpness,
     "random_erasing": build_random_erasing,
+    "static_erasing": build_static_erasing,
 }
 
 
@@ -150,6 +189,17 @@ def copy_episode(source, output, ep_idx, feature_keys, features_meta):
 def augment_episode(source, output, ep_idx, transform, feature_keys, camera_keys, features_meta):
     """Create an augmented copy of an episode."""
     from_idx, to_idx = get_episode_range(source, ep_idx)
+
+    # For static transforms, sample patch position once per episode
+    # by peeking at the first frame's image size
+    if isinstance(transform, StaticErasing):
+        first = source[from_idx]
+        for cam_key in camera_keys:
+            if cam_key in first:
+                _, h, w = first[cam_key].shape
+                transform.resample(h, w)
+                break
+
     for global_idx in range(from_idx, to_idx):
         item = source[global_idx]
         # Apply augmentation only to camera (visual) features
