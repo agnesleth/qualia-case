@@ -225,18 +225,6 @@ ROBOT_PRESETS = {
 class HorizontalFlipWithActionMirror:
     """Horizontally flip camera images AND mirror the corresponding action/state vectors.
 
-    Why action mirroring is necessary:
-        In robot learning, a policy maps visual observations to actions. If we
-        horizontally flip a camera image, what was "move left" in the original
-        frame now *looks like* "move right" in the flipped frame. If we keep
-        the action unchanged, we create a contradictory training signal: the
-        flipped image shows rightward motion but the label says "move left."
-
-        To maintain consistency, we must mirror the action vector to match the
-        flipped image. Specifically, action dimensions controlling lateral
-        (left-right) movement are negated, while vertical/depth/gripper
-        dimensions are left unchanged.
-
     Bimanual robots (e.g. ALOHA):
         For bimanual setups, flipping also swaps which physical arm appears on
         which side of the image. The left arm's actions must become the right
